@@ -1,0 +1,12 @@
+torch
+numpy
+librosa
+soundfile
+scipy
+torchcrepe
+faiss-cpu==1.7.4
+praat-parselmouth>=0.4.2
+onnxruntime
+pyworld
+tensorboardX
+git+https://github.com/One-sixth/fairseq.git

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvc-py"
+version = "0.1.0"
+description = "Retrieval-based Voice Conversion — modern Python 3.10+ library"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "faiss-cpu>=1.7",
+    "tqdm>=4.65",
+    "requests>=2.28",
+    "huggingface-hub>=0.20",
+    "praat-parselmouth>=0.4",
+]
+
+[project.optional-dependencies]
+torch-cuda121 = ["torch>=2.2"]
+torch-cpu     = ["torch>=2.2"]
+rt  = ["sounddevice>=0.4"]
+dev = ["build", "twine", "pytest", "ruff"]
+
+[project.scripts]
+rvc-infer    = "rvc_py._cli:cmd_infer"
+rvc-download = "rvc_py._cli:cmd_download"
+rvc-devices  = "rvc_py._cli:cmd_devices"
+rvc-rt       = "rvc_py._cli:cmd_realtime"
+
+[project.urls]
+Repository = "https://github.com/Sergey004/rvc-py"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["rvc_py*"]
+
+[tool.setuptools.package-data]
+"rvc_py" = ["py.typed"]
+"rvc_py.lib.infer_pack" = ["*.py"]
+"rvc_py.lib.infer_pack.F0Predictor" = ["*.py"]
