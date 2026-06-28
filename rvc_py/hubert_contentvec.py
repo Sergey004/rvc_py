@@ -15,17 +15,109 @@ import os
 import torch
 import torch.nn as nn
 
-# Читаем свич один раз при импорте модуля
 _ENCODER_BACKEND = os.environ.get("RVC_ENCODER", "hubert").lower().strip()
+
+
+class _ContentVecCompat(nn.Module):
+    """
+    Враппер над transformers HubertModel, который эмулирует fairseq API:
+      - extract_features(source, padding_mask, output_layer) → (tensor,)
+      - final_proj: nn.Linear(768, 256) если есть в чекпоинте
+
+    Это нужно чтобы rvc_infer._extract_features не менялся — он ожидает
+    fairseq-совместимый интерфейс.
+    """
+
+    def __init__(self, hf_model: nn.Module, ckpt_path_or_id: str):
+        super().__init__()
+        self.hf_model = hf_model
+
+        # Пробуем загрузить final_proj из чекпоинта (есть в lengyue233/content-vec-best)
+        self.final_proj = self._load_final_proj(ckpt_path_or_id)
+
+    def _load_final_proj(self, source: str) -> nn.Linear | None:
+        """
+        Пытается вытащить final_proj.weight / final_proj.bias из чекпоинта.
+        Возвращает nn.Linear или None если не нашёл.
+        """
+        try:
+            # HuggingFace кеш — ищем pytorch_model.bin или model.safetensors
+            import os
+            state: dict | None = None
+
+            if os.path.isfile(source):
+                # Локальный .bin
+                state = torch.load(source, map_location="cpu", weights_only=True)
+            else:
+                # HuggingFace hub id — грузим через snapshot
+                from huggingface_hub import hf_hub_download
+                try:
+                    path = hf_hub_download(source, "pytorch_model.bin")
+                    state = torch.load(path, map_location="cpu", weights_only=True)
+                except Exception:
+                    try:
+                        from safetensors.torch import load_file
+                        path = hf_hub_download(source, "model.safetensors")
+                        state = load_file(path, device="cpu")
+                    except Exception:
+                        pass
+
+            if state is None:
+                return None
+
+            w_key = "final_proj.weight"
+            b_key = "final_proj.bias"
+            if w_key in state:
+                out_dim, in_dim = state[w_key].shape
+                proj = nn.Linear(in_dim, out_dim, bias=b_key in state)
+                proj.weight = nn.Parameter(state[w_key])
+                if b_key in state:
+                    proj.bias = nn.Parameter(state[b_key])
+                print(f"[RVC] ContentVec: final_proj loaded ({in_dim}→{out_dim})")
+                return proj
+
+        except Exception as e:
+            print(f"[RVC] ContentVec: final_proj not loaded ({e}), using hidden state directly")
+
+        return None
+
+    def extract_features(
+        self,
+        source: torch.Tensor,
+        padding_mask: torch.Tensor,
+        output_layer: int,
+    ) -> tuple[torch.Tensor]:
+        """
+        Эмулирует fairseq extract_features API.
+        Возвращает кортеж (hidden_state,) — как fairseq логиты[0].
+        """
+        attention_mask = (~padding_mask).long()
+        out = self.hf_model(
+            input_values=source,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+
+        # hidden_states[0] = embedding, [1..13] = transformer layers
+        # output_layer=9 (v1) или 12 (v2) — берём соответствующий слой
+        n = len(out.hidden_states)
+        idx = min(output_layer, n - 1)
+        hidden = out.hidden_states[idx]  # (1, T', 768)
+
+        return (hidden,)
+
+    def forward(self, source: torch.Tensor) -> torch.Tensor:
+        """Прямой вызов без padding_mask (для совместимости с Hubert.forward)."""
+        padding_mask = torch.zeros(source.shape, dtype=torch.bool, device=source.device)
+        return self.extract_features(source, padding_mask, output_layer=12)[0]
 
 
 class Hubert(nn.Module):
     """
     Универсальный враппер feature extractor для RVC.
-    Поддерживает два бэкенда через RVC_ENCODER:
-      - 'hubert'      : fairseq HuBERT (ckpt_path обязателен)
-      - 'contentvec'  : HuggingFace lengyue233/content-vec-best
-                        (ckpt_path игнорируется, скачивается автоматически)
+
+    RVC_ENCODER=hubert      → fairseq HuBERT (ckpt_path обязателен)
+    RVC_ENCODER=contentvec  → HuggingFace ContentVec (ckpt_path игнорируется)
     """
 
     def __init__(self, ckpt_path: str, device: str = "cpu"):
@@ -41,10 +133,7 @@ class Hubert(nn.Module):
         self.model.eval()
         self.model.to(device)
 
-    # ── Инициализация бэкендов ────────────────────────────────────────────
-
     def _init_hubert(self, ckpt_path: str):
-        """Оригинальный fairseq HuBERT — требует fairseq."""
         try:
             import fairseq
             from fairseq.data.dictionary import Dictionary
@@ -53,55 +142,31 @@ class Hubert(nn.Module):
         except ImportError as e:
             raise ImportError(
                 "fairseq не установлен. Установите: pip install fairseq\n"
-                "Или переключитесь на ContentVec: RVC_ENCODER=contentvec"
+                "Или переключитесь: RVC_ENCODER=contentvec"
             ) from e
 
-        models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task(
+        models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
             [ckpt_path], suffix=""
         )
         self.model = models[0]
         print(f"[RVC] Encoder: HuBERT (fairseq) ← {ckpt_path}")
 
     def _init_contentvec(self):
-        """ContentVec через HuggingFace transformers — без fairseq."""
         try:
             from transformers import AutoModel
         except ImportError as e:
             raise ImportError(
-                "transformers не установлен. Установите: pip install transformers\n"
-                "Или переключитесь обратно: RVC_ENCODER=hubert"
+                "transformers не установлен: pip install transformers"
             ) from e
 
         model_id = os.environ.get("RVC_CONTENTVEC_MODEL", "lengyue233/content-vec-best")
         print(f"[RVC] Encoder: ContentVec (transformers) ← {model_id}")
-        self.model = AutoModel.from_pretrained(model_id)
 
-    # ── Forward — единый интерфейс для обоих бэкендов ────────────────────
+        hf_model = AutoModel.from_pretrained(model_id)
+        # Оборачиваем в fairseq-совместимый враппер
+        self.model = _ContentVecCompat(hf_model, model_id)
 
     def forward(self, wav_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Извлечь признаки из 16kHz аудио тензора.
-
-        Args:
-            wav_tensor: (1, T) float32 @ 16kHz
-
-        Returns:
-            Feature tensor (1, T', C)
-        """
+        """Extract features из 16kHz аудио тензора (1, T) → (1, T', C)."""
         with torch.no_grad():
-            if self._backend == "contentvec":
-                return self._forward_contentvec(wav_tensor)
-            return self._forward_hubert(wav_tensor)
-
-    def _forward_hubert(self, wav_tensor: torch.Tensor) -> torch.Tensor:
-        return self.model.extract_features(wav_tensor)[0]
-
-    def _forward_contentvec(self, wav_tensor: torch.Tensor) -> torch.Tensor:
-        # ContentVec через HuggingFace: нужен padding_mask
-        padding_mask = torch.zeros(wav_tensor.shape, dtype=torch.bool, device=self.device)
-        out = self.model(
-            input_values=wav_tensor,
-            attention_mask=(~padding_mask).long(),
-        )
-        # last_hidden_state: (1, T', C)
-        return out.last_hidden_state
+            return self.model(wav_tensor)
