@@ -28,9 +28,11 @@ def _resolve_device(device: str) -> str:
 
 
 def _ensure_models_dir() -> str:
-    models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "RVC")
-    os.makedirs(models_dir, exist_ok=True)
-    return models_dir
+    """Возвращает директорию моделей через download_models.get_models_dir().
+    Управляется через RVC_MODELS_DIR или дефолт ~/.cache/rvc/models.
+    """
+    from .download_models import get_models_dir
+    return get_models_dir()
 
 
 def _get_or_create_models(
