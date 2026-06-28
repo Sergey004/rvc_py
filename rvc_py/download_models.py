@@ -1,21 +1,44 @@
-"""Automatic model downloader for RMVPE and HuBERT from HuggingFace.
+"""Automatic model downloader for RVC via huggingface_hub.
 
-Путь для сохранения моделей определяется в порядке приоритета:
+Модели скачиваются через HF hub в стандартный кеш (~/.cache/huggingface/hub),
+затем симлинкуются/копируются в RVC_MODELS_DIR.
+
+Путь RVC_MODELS_DIR определяется в порядке приоритета:
   1. Переменная окружения RVC_MODELS_DIR
-  2. ~/.cache/rvc/models  (XDG-совместимый дефолт)
+  2. ~/.cache/rvc/models
+
+Переменные окружения huggingface_hub тоже работают:
+  HF_TOKEN        — для приватных репо
+  HF_HOME         — альтернативный HF кеш
+  HF_HUB_OFFLINE  — офлайн режим (только из кеша)
 
 Пример:
-    RVC_MODELS_DIR=/data/rvc_models python xiaozhi_server.py
+    RVC_MODELS_DIR=/data/rvc python xiaozhi_server.py
+    HF_TOKEN=hf_xxx RVC_MODELS_DIR=/data/rvc python xiaozhi_server.py
+
+CLI (после pip install rvc-py):
+    rvc-download --models rmvpe hubert
+    rvc-download --models rmvpe --dir /data/rvc
 """
 from __future__ import annotations
 
 import os
-import requests
+import shutil
 
-MODEL_URLS = {
-    "rmvpe.pt":      "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt",
-    "rmvpe.onnx":    "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx",
-    "hubert_base.pt": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt",
+# Таблица: имя файла → (hf_repo_id, filename_in_repo)
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "hubert_base.pt": (
+        "lj1995/VoiceConversionWebUI",
+        "hubert_base.pt",
+    ),
+    "rmvpe.pt": (
+        "lj1995/VoiceConversionWebUI",
+        "rmvpe.pt",
+    ),
+    "rmvpe.onnx": (
+        "lj1995/VoiceConversionWebUI",
+        "rmvpe.onnx",
+    ),
 }
 
 
@@ -28,54 +51,94 @@ def get_models_dir() -> str:
       2. ~/.cache/rvc/models
     """
     env = os.environ.get("RVC_MODELS_DIR")
-    if env:
-        path = os.path.expanduser(env)
-    else:
-        path = os.path.join(os.path.expanduser("~"), ".cache", "rvc", "models")
+    path = os.path.expanduser(env) if env else os.path.join(
+        os.path.expanduser("~"), ".cache", "rvc", "models"
+    )
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def download_model(model_name: str, out_dir: str | None = None) -> str:
-    """Download a model file if not already present.
+    """
+    Скачать модель через huggingface_hub.
+
+    Файл скачивается в HF кеш (~/.cache/huggingface/hub),
+    затем копируется в out_dir (или RVC_MODELS_DIR).
 
     Args:
-        model_name: Key in MODEL_URLS (e.g. 'hubert_base.pt').
-        out_dir: Директория для сохранения. Если None — использует get_models_dir().
+        model_name: Ключ из MODEL_REGISTRY (например 'hubert_base.pt').
+        out_dir: Куда положить файл. None = get_models_dir().
 
     Returns:
-        Абсолютный путь к скачанному файлу.
+        Абсолютный путь к файлу в out_dir.
     """
-    if out_dir is None:
-        out_dir = get_models_dir()
+    if model_name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"[RVC] Unknown model: '{model_name}'. "
+            f"Available: {list(MODEL_REGISTRY)}"
+        )
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, model_name)
+    target_dir = out_dir or get_models_dir()
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, model_name)
 
-    if os.path.exists(out_path):
-        print(f"[RVC] {model_name} already exists: {out_path}")
-        return out_path
+    if os.path.exists(target_path):
+        return target_path
 
-    if model_name not in MODEL_URLS:
-        raise ValueError(f"[RVC] Unknown model: {model_name}. Available: {list(MODEL_URLS)}")
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface_hub не установлен: pip install huggingface-hub"
+        ) from e
 
-    url = MODEL_URLS[model_name]
-    print(f"[RVC] Downloading {model_name} → {out_path}")
-    r = requests.get(url, stream=True)
-    r.raise_for_status()
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print(f"[RVC] Downloaded: {out_path}")
-    return out_path
+    repo_id, filename = MODEL_REGISTRY[model_name]
+    print(f"[RVC] Downloading {model_name} from {repo_id} ...")
+
+    # hf_hub_download кладёт файл в HF кеш и возвращает путь
+    cached_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="model",
+        # token подхватывается из HF_TOKEN или huggingface-cli login
+    )
+
+    # Копируем/симлинкуем из HF кеша в RVC_MODELS_DIR
+    try:
+        os.symlink(cached_path, target_path)
+    except (OSError, NotImplementedError):
+        # Windows или нет прав на symlink — просто копируем
+        shutil.copy2(cached_path, target_path)
+
+    print(f"[RVC] Ready: {target_path}")
+    return target_path
 
 
-def download_all_models(out_dir: str | None = None) -> None:
-    """Download all known models."""
+def download_all_models(
+    models: list[str] | None = None,
+    out_dir: str | None = None,
+) -> dict[str, str]:
+    """
+    Скачать несколько моделей.
+
+    Args:
+        models: Список ключей из MODEL_REGISTRY. None = все.
+        out_dir: Куда положить. None = get_models_dir().
+
+    Returns:
+        dict {model_name: path}
+    """
+    names = models or list(MODEL_REGISTRY)
     target = out_dir or get_models_dir()
-    print(f"[RVC] Downloading all models to: {target}")
-    for name in MODEL_URLS:
-        download_model(name, out_dir=target)
+    print(f"[RVC] Models dir: {target}")
+    results = {}
+    for name in names:
+        results[name] = download_model(name, out_dir=target)
+    return results
+
+
+# Алиас для rvc-download CLI (см. _cli.py)
+download = download_all_models
 
 
 if __name__ == "__main__":

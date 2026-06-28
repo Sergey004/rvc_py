@@ -9,4 +9,5 @@ praat-parselmouth>=0.4.2
 onnxruntime
 pyworld
 tensorboardX
+huggingface-hub
 git+https://github.com/One-sixth/fairseq.git
