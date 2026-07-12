@@ -66,6 +66,17 @@ def cmd_devices():
         sys.exit(1)
 
 
+def cmd_serve():
+    """rvc-serve --model model.pth [--index model.index] [--port 8788]
+
+    Client/server real-time voice conversion через WebSocket.
+    Открой rvc_py/web_client/index.html в браузере и подключись к серверу
+    (или используй любой WS-клиент, говорящий на протоколе из server.py).
+    """
+    from rvc_py.server import main as server_main
+    server_main()
+
+
 def cmd_realtime():
     """rvc-rt --model model.pth [--pitch 0] [--input 1] [--output 3] [--block 1024]"""
     p = argparse.ArgumentParser(description="RVC real-time voice changer")

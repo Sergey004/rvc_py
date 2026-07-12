@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>RVC Real-Time Client</title>
+<style>
+  :root {
+    --bg: #14141a; --panel: #1f1f28; --accent: #7c5cff; --accent2: #ff6b9d;
+    --text: #eee; --muted: #888; --ok: #4ade80; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 40px 16px; min-height: 100vh; margin: 0;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  .panel {
+    background: var(--panel); border-radius: 16px; padding: 24px;
+    width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 18px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+  }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 6px; }
+  input[type=text] {
+    width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #333;
+    background: #101014; color: var(--text); font-size: 14px;
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .row { display: flex; justify-content: space-between; align-items: center; }
+  .pitch-val { font-variant-numeric: tabular-nums; color: var(--accent2); font-weight: 600; }
+  button {
+    padding: 12px 20px; border-radius: 10px; border: none; font-size: 15px;
+    font-weight: 600; cursor: pointer; transition: 0.15s;
+  }
+  #connectBtn { background: var(--accent); color: white; }
+  #connectBtn:hover { filter: brightness(1.1); }
+  #connectBtn.connected { background: var(--err); }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.err { background: var(--err); }
+  .meter {
+    height: 6px; background: #101014; border-radius: 3px; overflow: hidden;
+  }
+  .meter-fill {
+    height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width 0.05s linear;
+  }
+  .log {
+    font-size: 11px; color: var(--muted); max-height: 100px; overflow-y: auto;
+    font-family: monospace; white-space: pre-wrap; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<h1>RVC Real-Time Client</h1>
+<div class="sub">Client / Server voice conversion — говори в микрофон, слушай на выходе</div>
+
+<div class="panel">
+
+  <div>
+    <label>WebSocket сервер</label>
+    <input type="text" id="serverUrl" value="ws://localhost:8788" placeholder="ws://host:port">
+  </div>
+
+  <div>
+    <div class="row">
+      <label style="margin:0">Питч (полутоны)</label>
+      <span class="pitch-val" id="pitchVal">0</span>
+    </div>
+    <input type="range" id="pitchSlider" min="-24" max="24" value="0" step="1">
+  </div>
+
+  <button id="connectBtn">Подключиться и говорить</button>
+
+  <div class="status">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">Не подключено</span>
+  </div>
+
+  <div>
+    <label>Уровень входа (микрофон)</label>
+    <div class="meter"><div class="meter-fill" id="inputMeter"></div></div>
+  </div>
+
+  <div class="log" id="log"></div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let captureNode = null;
+let playbackNode = null;
+let connected = false;
+
+const CHUNK_SAMPLES = 2048; // ~43ms @ 48kHz — размер посылки на сервер
+
+// AudioWorklet: захват микрофона чанками фиксированного размера
+const CAPTURE_WORKLET = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(${CHUNK_SAMPLES});
+    this.pos = 0;
+  }
+  process(inputs) {
+    const input = inputs[0][0];
+    if (!input) return true;
+    for (let i = 0; i < input.length; i++) {
+      this.buf[this.pos++] = input[i];
+      if (this.pos >= this.buf.length) {
+        this.port.postMessage(this.buf.slice(0));
+        this.pos = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('capture-processor', CaptureProcessor);
+`;
+
+// AudioWorklet: воспроизведение через кольцевой буфер (без щелчков)
+const PLAYBACK_WORKLET = `
+class PlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ringSize = sampleRate * 4;
+    this.ring = new Float32Array(this.ringSize);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.available = 0;
+    this.port.onmessage = (e) => {
+      const chunk = e.data;
+      for (let i = 0; i < chunk.length; i++) {
+        this.ring[this.writePos] = chunk[i];
+        this.writePos = (this.writePos + 1) % this.ringSize;
+        if (this.available < this.ringSize) this.available++;
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const output = outputs[0][0];
+    for (let i = 0; i < output.length; i++) {
+      if (this.available > 0) {
+        output[i] = this.ring[this.readPos];
+        this.readPos = (this.readPos + 1) % this.ringSize;
+        this.available--;
+      } else {
+        output[i] = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('playback-processor', PlaybackProcessor);
+`;
+
+function makeWorkletURL(code) {
+  return URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+}
+
+function setStatus(text, cls) {
+  $('statusText').textContent = text;
+  $('statusDot').className = 'dot' + (cls ? ' ' + cls : '');
+}
+
+async function connect() {
+  const url = $('serverUrl').value.trim();
+  if (!url) { log('Укажи адрес сервера'); return; }
+
+  setStatus('Подключение...', '');
+  log(`Подключаюсь к ${url}`);
+
+  try {
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = async () => {
+      log('WebSocket открыт, запускаю аудио...');
+      await startAudio();
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'ready') {
+          setStatus('Подключено, говори!', 'ok');
+          log(`Сервер готов, sample_rate=${msg.sample_rate}`);
+        } else if (msg.type === 'error') {
+          setStatus('Ошибка сервера', 'err');
+          log(`Ошибка: ${msg.message}`);
+        }
+        return;
+      }
+      const floatData = new Float32Array(event.data);
+      if (playbackNode) {
+        playbackNode.port.postMessage(floatData);
+      }
+    };
+
+    ws.onerror = () => {
+      setStatus('Ошибка соединения', 'err');
+      log('WebSocket ошибка');
+    };
+
+    ws.onclose = () => {
+      setStatus('Отключено', '');
+      log('WebSocket закрыт');
+      stopAudio();
+      connected = false;
+      $('connectBtn').textContent = 'Подключиться и говорить';
+      $('connectBtn').classList.remove('connected');
+    };
+
+  } catch (e) {
+    log(`Ошибка: ${e.message}`);
+    setStatus('Ошибка', 'err');
+  }
+}
+
+async function startAudio() {
+  audioCtx = new AudioContext();
+  const sampleRate = audioCtx.sampleRate;
+
+  const pitch = parseInt($('pitchSlider').value, 10);
+  ws.send(JSON.stringify({
+    type: 'init',
+    sample_rate: sampleRate,
+    pitch_shift: pitch,
+    f0_method: 'rmvpe',
+    block_size: 2048,
+  }));
+  log(`AudioContext sample_rate=${sampleRate}`);
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  await audioCtx.audioWorklet.addModule(makeWorkletURL(CAPTURE_WORKLET));
+  await audioCtx.audioWorklet.addModule(makeWorkletURL(PLAYBACK_WORKLET));
+
+  const micSource = audioCtx.createMediaStreamSource(micStream);
+  captureNode = new AudioWorkletNode(audioCtx, 'capture-processor');
+  playbackNode = new AudioWorkletNode(audioCtx, 'playback-processor');
+
+  captureNode.port.onmessage = (e) => {
+    const chunk = e.data;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk.buffer);
+    }
+    let sum = 0;
+    for (let i = 0; i < chunk.length; i++) sum += chunk[i] * chunk[i];
+    const rms = Math.sqrt(sum / chunk.length);
+    $('inputMeter').style.width = Math.min(100, rms * 400) + '%';
+  };
+
+  micSource.connect(captureNode);
+  playbackNode.connect(audioCtx.destination);
+
+  connected = true;
+  $('connectBtn').textContent = 'Отключиться';
+  $('connectBtn').classList.add('connected');
+  log('Аудио запущено — говори в микрофон');
+}
+
+function stopAudio() {
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+  if (audioCtx) {
+    audioCtx.close();
+    audioCtx = null;
+  }
+  captureNode = null;
+  playbackNode = null;
+  $('inputMeter').style.width = '0%';
+}
+
+function disconnect() {
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  stopAudio();
+}
+
+$('connectBtn').addEventListener('click', () => {
+  if (connected) {
+    disconnect();
+  } else {
+    connect();
+  }
+});
+
+$('pitchSlider').addEventListener('input', (e) => {
+  const val = parseInt(e.target.value, 10);
+  $('pitchVal').textContent = (val > 0 ? '+' : '') + val;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'set_pitch', value: val }));
+  }
+});
+</script>
+
+</body>
+</html>
