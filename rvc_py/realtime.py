@@ -143,7 +143,8 @@ class RVCStreamer:
             pitch  = torch.tensor(f0_coarse, device=self.device).unsqueeze(0).long()
             pitchf = torch.tensor(f0_rs,     device=self.device).unsqueeze(0).float()
 
-            out = self._rvc.infer(units, pitch=pitch, pitchf=pitchf, sid=0)
+            use_idx = self.index_path is not None and self.index_rate > 0.0
+            out = self._rvc.infer(units, pitch=pitch, pitchf=pitchf, sid=0, use_index=use_idx)
             wav = out[0] if isinstance(out, tuple) else out
             return wav.detach().cpu().numpy().squeeze().astype(np.float32)
 
