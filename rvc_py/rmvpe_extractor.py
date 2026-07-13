@@ -571,6 +571,20 @@ class RMVPE:
         return devided
 
 
+# Кеш инстансов RMVPE — БЕЗ него модель (веса U-Net + BiGRU) грузилась бы
+# с диска заново на КАЖДЫЙ чанк потокового аудио, что даёт огромную
+# задержку и как следствие — рассинхрон буфера, октавные ошибки и "шумный" выход.
+_rmvpe_cache: dict[tuple, "RMVPE"] = {}
+
+
+def _get_or_create_rmvpe(rmvpe_model_path: str, device: str) -> "RMVPE":
+    key = (rmvpe_model_path, device)
+    if key not in _rmvpe_cache:
+        logger.info(f"[RMVPE] Loading model (first use): {rmvpe_model_path} on {device}")
+        _rmvpe_cache[key] = RMVPE(rmvpe_model_path, device=device)
+    return _rmvpe_cache[key]
+
+
 def extract_f0_rmvpe(wav, sr, rmvpe_model_path, device='cpu'):
-    rmvpe = RMVPE(rmvpe_model_path, device=device)
+    rmvpe = _get_or_create_rmvpe(rmvpe_model_path, device)
     return rmvpe.infer(wav, sr)

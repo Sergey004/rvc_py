@@ -10,4 +10,4 @@ onnxruntime
 pyworld
 tensorboardX
 huggingface-hub
-git+https://github.com/One-sixth/fairseq.git
+fairseq @ git+https://github.com/One-sixth/fairseq.git
