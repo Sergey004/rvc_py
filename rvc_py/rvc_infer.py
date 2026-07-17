@@ -103,8 +103,15 @@ def _extract_f0(
     f0_method: str,
     device: str,
     rmvpe_model_path: Optional[str],
+    thred: float = 0.03,
 ) -> np.ndarray:
-    """Extract fundamental frequency in Hz."""
+    """Extract fundamental frequency in Hz.
+
+    thred: Порог уверенности RMVPE (не используется для других f0_method).
+        Кадры, где максимум уверенности ниже порога, считаются невокализованными
+        (f0=0). 0.03 — дефолт, который и так был зашит в RMVPE.infer до этой правки,
+        поэтому омиссия этого аргумента ничего не меняет.
+    """
     if f0_method == "rmvpe":
         models_dir = _ensure_models_dir()
         if rmvpe_model_path is None:
@@ -112,7 +119,7 @@ def _extract_f0(
         if not os.path.exists(rmvpe_model_path):
             print("[RVC] RMVPE not found, downloading...")
             rmvpe_model_path = download_model("rmvpe.pt", out_dir=models_dir)
-        return extract_f0_rmvpe(wav, sr, rmvpe_model_path, device=device)
+        return extract_f0_rmvpe(wav, sr, rmvpe_model_path, device=device, thred=thred)
     return extract_f0(wav, sr, method=f0_method, device=device)
 
 
@@ -137,6 +144,40 @@ def _f0_to_coarse(f0_hz: np.ndarray, target_len: int) -> tuple[np.ndarray, np.nd
     return f0_coarse, f0_rs
 
 
+def _change_rms(
+    source: np.ndarray, source_sr: int, target: np.ndarray, target_sr: int, rate: float
+) -> np.ndarray:
+    """Подмешивает громкостную огибающую (RMS) исходного аудио в сконвертированное —
+    сохраняет оригинальную динамику/интонацию громкости вместо той, что
+    "придумала" модель. Вызывается только когда rms_mix_rate < 1.0 (см. rvc_infer).
+
+    rate=1.0 — чистый выход модели, rate=0.0 — полностью огибающая оригинала.
+
+    Формула frame_length/hop_length сверена с актуальным Applio
+    (rvc/infer/pipeline.py::AudioProcessor.change_rms) — они там перешли с короткого
+    окна (~100мс) на гораздо более широкое (~1с фрейм, 0.5с hop) по сравнению
+    с старым RVC WebUI 2023 года.
+    """
+    frame_src = max(source_sr // 2 * 2, 32)
+    hop_src = max(source_sr // 2, 8)
+    rms_src = librosa.feature.rms(y=source, frame_length=frame_src, hop_length=hop_src)[0]
+
+    frame_tgt = max(target_sr // 2 * 2, 32)
+    hop_tgt = max(target_sr // 2, 8)
+    rms_tgt = librosa.feature.rms(y=target, frame_length=frame_tgt, hop_length=hop_tgt)[0]
+
+    x_out = np.linspace(0, 1, num=len(target), dtype=np.float32)
+    x_src = np.linspace(0, 1, num=len(rms_src), dtype=np.float32)
+    x_tgt = np.linspace(0, 1, num=len(rms_tgt), dtype=np.float32)
+
+    rms_src_i = np.interp(x_out, x_src, rms_src)
+    rms_tgt_i = np.interp(x_out, x_tgt, rms_tgt)
+    rms_tgt_i = np.maximum(rms_tgt_i, 1e-6)
+
+    gain = (rms_src_i ** (1 - rate)) * (rms_tgt_i ** (rate - 1))
+    return (target * gain).astype(np.float32)
+
+
 def rvc_infer(
     wav: np.ndarray,
     sr: int,
@@ -151,6 +192,9 @@ def rvc_infer(
     pitch_shift: int = 0,
     use_index: bool = False,
     sample_rate: Optional[int] = None,
+    filter_radius: float = 0.03,
+    rms_mix_rate: float = 1.0,
+    protect: float = 0.5,
 ) -> tuple[np.ndarray, int]:
     """Run RVC voice conversion.
 
@@ -168,6 +212,18 @@ def rvc_infer(
         pitch_shift: Pitch shift in semitones.
         use_index: Enable Faiss retrieval blending.
         sample_rate: Override output sample rate (None = use model default).
+        filter_radius: Порог уверенности RMVPE (только для f0_method="rmvpe").
+            ВНИМАНИЕ: это НЕ медианный фильтр (как в старом RVC WebUI 2023 года) —
+            в актуальном Applio это тот же параметр, что и `thred` внутри самого
+            RMVPE-декодера: кадры с уверенностью ниже порога считаются
+            невокализованными (f0=0). 0.03 — дефолт и Applio, и того, что было
+            зашито в этом коде до этой правки — омиссия этого аргумента ничего не меняет.
+        rms_mix_rate: Подмес громкостной огибающей оригинала. 1.0 = выключено
+            (дефолт, ни какого доп. вычисления), чистый выход модели. Меньше 1.0 —
+            больше оригинальной динамики громкости входного аудио.
+        protect: Защита глухих/согласных участков от заглушения. 0.5 = выключено
+            (дефолт, ни какого доп. вычисления). Меньше 0.5 — сильнее защита
+            (0.33 — типичный дефолт в Applio).
 
     Returns:
         (output_audio, output_sample_rate) tuple.
@@ -180,8 +236,8 @@ def rvc_infer(
     # Extract HuBERT features
     units = _extract_features(hubert, wav, sr, device, rvc.version)
 
-    # Extract F0
-    f0_hz = _extract_f0(wav, sr, f0_method, device, rmvpe_model_path)
+    # Extract F0 (filter_radius — это thred внутри RMVPE, не отдельный пост-фильтр)
+    f0_hz = _extract_f0(wav, sr, f0_method, device, rmvpe_model_path, thred=filter_radius)
     if pitch_shift != 0:
         f0_hz = f0_hz * (2 ** (pitch_shift / 12))
 
@@ -191,9 +247,16 @@ def rvc_infer(
     pitchf = torch.tensor(f0_rs, device=device).unsqueeze(0).float()
 
     # Run model inference
-    out = rvc.infer(units, pitch=pitch, pitchf=pitchf, sid=0, use_index=use_index)
+    out = rvc.infer(
+        units, pitch=pitch, pitchf=pitchf, sid=0, use_index=use_index, protect=protect
+    )
     wav_out = out[0] if isinstance(out, tuple) else out
     wav_out = wav_out.detach().cpu().numpy().squeeze()
 
     out_sr = rvc.sample_rate if sample_rate is None else sample_rate
+
+    # Подмес громкостной огибающей оригинала — только если явно запрошено
+    if rms_mix_rate < 1.0:
+        wav_out = _change_rms(wav, sr, wav_out, out_sr, rms_mix_rate)
+
     return wav_out, out_sr

@@ -90,6 +90,7 @@ class RVCModel(nn.Module):
         pitchf: Optional[torch.Tensor] = None,
         sid: int = 0,
         use_index: bool = False,
+        protect: float = 0.5,
     ) -> tuple[torch.Tensor, ...]:
         """Run voice conversion inference.
 
@@ -99,6 +100,10 @@ class RVCModel(nn.Module):
             pitchf: Fine pitch in Hz (1, T) as float tensor.
             sid: Speaker ID.
             use_index: Whether to apply Faiss retrieval blending.
+            protect: Защита глухих/согласных участков (шёпот, свистящие) от
+                "оробочивания"/заглушения в зонах с низкой уверенностью f0.
+                0.5 = выключено (по умолчанию, ни какого доп. вычисления).
+                Меньше 0.5 — сильнее защита (0.33 — типичный дефолт в Applio).
 
         Returns:
             Model output tuple (wav, ...).
@@ -108,6 +113,10 @@ class RVCModel(nn.Module):
                 units = units.half()
                 if pitchf is not None:
                     pitchf = pitchf.half()
+
+            # Сырые (до-индекс) HuBERT-фичи — нужны только если protect включён,
+            # чтобы не тащить лишний clone(), когда он не нужен.
+            feats0 = units.clone() if protect < 0.5 else None
 
             # Faiss retrieval blending
             if use_index and self.index is not None and self.index_rate > 0.0:
@@ -131,6 +140,17 @@ class RVCModel(nn.Module):
                     units = units.to(torch.float16) if self.fp16 else units.to(torch.float32)
                 except Exception:
                     pass
+
+            # Protect voiceless consonants: в участках с низким/нулевым f0 (тишина,
+            # шёпот, свистящие) подмешиваем обратно "сырые" фичи до индекс-блендинга,
+            # чтобы избежать заглушённого/роботизированного звука на выдохах.
+            if protect < 0.5 and pitchf is not None and feats0 is not None:
+                pitchff = pitchf.clone()
+                pitchff[pitchf > 0] = 1.0
+                pitchff[pitchf < 1] = protect
+                pitchff = pitchff.unsqueeze(-1)
+                units = units * pitchff + feats0 * (1 - pitchff)
+                units = units.to(feats0.dtype)
 
             phone_lengths = torch.tensor([units.shape[1]], device=self.device).long()
             sid_tensor = torch.tensor([sid], device=self.device).long()

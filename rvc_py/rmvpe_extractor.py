@@ -585,6 +585,6 @@ def _get_or_create_rmvpe(rmvpe_model_path: str, device: str) -> "RMVPE":
     return _rmvpe_cache[key]
 
 
-def extract_f0_rmvpe(wav, sr, rmvpe_model_path, device='cpu'):
+def extract_f0_rmvpe(wav, sr, rmvpe_model_path, device='cpu', thred=0.03):
     rmvpe = _get_or_create_rmvpe(rmvpe_model_path, device)
-    return rmvpe.infer(wav, sr)
+    return rmvpe.infer(wav, sr, thred=thred)

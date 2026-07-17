@@ -110,6 +110,9 @@ def convert_file(
     out_sample_rate: int = 40000,
     bit_depth: int = 16,
     mp3_bitrate: int = 128,
+    filter_radius: float = 0.03,
+    rms_mix_rate: float = 1.0,
+    protect: float = 0.5,
 ) -> None:
     """Конвертирует один файл через RVC и сохраняет в нужном формате/параметрах."""
     from rvc_py.rvc_infer import rvc_infer
@@ -122,6 +125,7 @@ def convert_file(
         wav, sr, rvc_model_path,
         device=device, index_path=index_path, index_rate=index_rate,
         pitch_shift=pitch_shift, f0_method=f0_method,
+        filter_radius=filter_radius, rms_mix_rate=rms_mix_rate, protect=protect,
     )
 
     final_audio, subtype = _resample_and_bitdepth(out_wav, out_sr, out_sample_rate, bit_depth)
@@ -150,6 +154,9 @@ def bulk_convert(
     bit_depth: int = 16,
     mp3_bitrate: int = 128,
     preserve_structure: bool = True,
+    filter_radius: float = 0.03,
+    rms_mix_rate: float = 1.0,
+    protect: float = 0.5,
 ) -> list[str]:
     """
     Гоняет все файлы из input_path (файл или папка, рекурсивно) через RVC.
@@ -187,6 +194,7 @@ def bulk_convert(
                 pitch_shift=pitch_shift, f0_method=f0_method,
                 out_format=out_format, out_sample_rate=out_sample_rate,
                 bit_depth=bit_depth, mp3_bitrate=mp3_bitrate,
+                filter_radius=filter_radius, rms_mix_rate=rms_mix_rate, protect=protect,
             )
             outputs.append(out_path)
         except Exception as e:
@@ -223,6 +231,20 @@ def main():
         help="Не сохранять структуру подпапок, всё в output/ плоско",
     )
 
+    p.add_argument(
+        "--filter-radius", type=float, default=0.03,
+        help="Порог уверенности RMVPE (thred). Не медианный фильтр — см. rvc_infer.py. "
+             "0.03 = дефолт Applio и прежнее захардкоженное поведение",
+    )
+    p.add_argument(
+        "--rms-mix-rate", type=float, default=1.0,
+        help="Подмес громкостной огибающей. 1.0 = выключено",
+    )
+    p.add_argument(
+        "--protect", type=float, default=0.5,
+        help="Защита глухих участков. 0.5 = выключено, 0.33 = дефолт Applio",
+    )
+
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -243,6 +265,8 @@ def main():
         device=args.device, index_path=args.index, index_rate=args.index_rate,
         pitch_shift=args.pitch, f0_method=args.f0,
         preserve_structure=not args.flat,
+        filter_radius=args.filter_radius, rms_mix_rate=args.rms_mix_rate,
+        protect=args.protect,
         **cfg,
     )
 
