@@ -66,6 +66,16 @@ def cmd_devices():
         sys.exit(1)
 
 
+def cmd_bulk():
+    """rvc-bulk --input dir --output dir --model model.pth [--preset game_modern]
+
+    Bulk конверсия папки/файла через RVC с ре-энкодингом в WAV/MP3.
+    Модели кешируются между файлами — грузятся один раз на весь батч.
+    """
+    from rvc_py.bulk_convert import main as bulk_main
+    bulk_main()
+
+
 def cmd_serve():
     """rvc-serve --model model.pth [--index model.index] [--port 8788]
 

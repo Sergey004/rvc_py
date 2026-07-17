@@ -26,6 +26,7 @@ torch-cuda121 = ["torch>=2.2"]
 torch-cpu     = ["torch>=2.2"]
 rt     = ["sounddevice>=0.4"]
 server = ["websockets>=12"]
+bulk   = ["pydub>=0.25"]   # для MP3-экспорта, нужен ffmpeg в PATH
 dev    = ["build", "twine", "pytest", "ruff"]
 
 [project.scripts]
@@ -34,6 +35,7 @@ rvc-download = "rvc_py._cli:cmd_download"
 rvc-devices  = "rvc_py._cli:cmd_devices"
 rvc-rt       = "rvc_py._cli:cmd_realtime"
 rvc-serve    = "rvc_py._cli:cmd_serve"
+rvc-bulk     = "rvc_py._cli:cmd_bulk"
 
 [project.urls]
 Repository = "https://github.com/Sergey004/rvc-py"
