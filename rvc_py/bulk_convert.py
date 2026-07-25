@@ -97,6 +97,39 @@ def _export_mp3(audio: np.ndarray, sr: int, out_path: str, bitrate: int):
     seg.export(out_path, format="mp3", bitrate=f"{bitrate}k")
 
 
+def _auto_gain_db(audio: np.ndarray, target_peak_db: float = -1.0) -> float:
+    """
+    Вычисляет дБ усиления/ослабления, чтобы довести пик сигнала до target_peak_db.
+    Полезно для батч-конверсии — приводит все реплики к одному уровню
+    громкости автоматически, без ручного подбора --gain для каждого файла.
+    target_peak_db=-1.0 — оставляет 1 дБ запаса от 0 dBFS (защита от
+    intersample-пиков при последующем MP3-энкодинге).
+    """
+    peak = float(np.abs(audio).max()) if len(audio) else 0.0
+    if peak < 1e-6:
+        return 0.0
+    target_linear = 10 ** (target_peak_db / 20.0)
+    return float(20 * np.log10(target_linear / peak))
+
+
+def _apply_gain(audio: np.ndarray, gain_db: float) -> np.ndarray:
+    """Линейное усиление/ослабление в дБ. Гасит в [-1, 1] чтобы избежать
+    заворачивания (wraparound) при конвертации в int16, если гейн слишком большой.
+    gain_db=0.0 — выключено, никакого доп. вычисления.
+    """
+    if gain_db == 0.0:
+        return audio
+    gain_linear = 10 ** (gain_db / 20.0)
+    out = (audio * gain_linear).astype(np.float32)
+    peak = np.abs(out).max() if len(out) else 0.0
+    if peak > 1.0:
+        logger.warning(
+            f"Гейн {gain_db:+.1f}дБ даёт клиппинг (пик={peak:.2f}), ограничиваю до 0 dBFS"
+        )
+        out = np.clip(out, -1.0, 1.0)
+    return out
+
+
 def convert_file(
     in_path: str,
     out_path: str,
@@ -113,6 +146,9 @@ def convert_file(
     filter_radius: float = 0.03,
     rms_mix_rate: float = 1.0,
     protect: float = 0.5,
+    gain_db: float = 0.0,
+    auto_gain: bool = False,
+    target_peak_db: float = -1.0,
 ) -> None:
     """Конвертирует один файл через RVC и сохраняет в нужном формате/параметрах."""
     from rvc_py.rvc_infer import rvc_infer
@@ -127,6 +163,12 @@ def convert_file(
         pitch_shift=pitch_shift, f0_method=f0_method,
         filter_radius=filter_radius, rms_mix_rate=rms_mix_rate, protect=protect,
     )
+
+    total_gain_db = gain_db
+    if auto_gain:
+        total_gain_db += _auto_gain_db(out_wav, target_peak_db)
+
+    out_wav = _apply_gain(out_wav, total_gain_db)
 
     final_audio, subtype = _resample_and_bitdepth(out_wav, out_sr, out_sample_rate, bit_depth)
 
@@ -157,6 +199,9 @@ def bulk_convert(
     filter_radius: float = 0.03,
     rms_mix_rate: float = 1.0,
     protect: float = 0.5,
+    gain_db: float = 0.0,
+    auto_gain: bool = False,
+    target_peak_db: float = -1.0,
 ) -> list[str]:
     """
     Гоняет все файлы из input_path (файл или папка, рекурсивно) через RVC.
@@ -195,6 +240,7 @@ def bulk_convert(
                 out_format=out_format, out_sample_rate=out_sample_rate,
                 bit_depth=bit_depth, mp3_bitrate=mp3_bitrate,
                 filter_radius=filter_radius, rms_mix_rate=rms_mix_rate, protect=protect,
+                gain_db=gain_db, auto_gain=auto_gain, target_peak_db=target_peak_db,
             )
             outputs.append(out_path)
         except Exception as e:
@@ -244,6 +290,18 @@ def main():
         "--protect", type=float, default=0.5,
         help="Защита глухих участков. 0.5 = выключено, 0.33 = дефолт Applio",
     )
+    p.add_argument(
+        "--gain", type=float, default=0.0,
+        help="Доп. усиление в дБ (+6 если тихо для Source). Автоограничение при клиппинге",
+    )
+    p.add_argument(
+        "--auto-gain", action="store_true",
+        help="Автоматически выровнять пик каждого файла до --target-peak (складывается с --gain)",
+    )
+    p.add_argument(
+        "--target-peak", type=float, default=-1.0,
+        help="Целевой пик в dBFS для --auto-gain (дефолт -1.0)",
+    )
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -267,6 +325,8 @@ def main():
         preserve_structure=not args.flat,
         filter_radius=args.filter_radius, rms_mix_rate=args.rms_mix_rate,
         protect=args.protect,
+        gain_db=args.gain,
+        auto_gain=args.auto_gain, target_peak_db=args.target_peak,
         **cfg,
     )
 

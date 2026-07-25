@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -14,13 +15,15 @@ from .hubert_contentvec import Hubert
 from .rmvpe_extractor import extract_f0_rmvpe
 from .rvc_model import RVCModel
 
+logger = logging.getLogger("rvc_infer")
+
 _rvc_cache: dict[tuple, tuple[Hubert, RVCModel]] = {}
 
 
 def _resolve_device(device: str) -> str:
     """Normalize device string; fall back to CPU if CUDA is unavailable."""
     if device.startswith("cuda") and not torch.cuda.is_available():
-        print(f"[RVC] CUDA unavailable, falling back to CPU (requested: {device})")
+        logger.warning(f"[RVC] CUDA unavailable, falling back to CPU (requested: {device})")
         return "cpu"
     if device == "cuda":
         return "cuda:0"
@@ -46,7 +49,7 @@ def _get_or_create_models(
     """Return cached (hubert, rvc) pair, loading from disk if needed."""
     cache_key = (rvc_model_path, index_path, fp16, device)
     if cache_key in _rvc_cache:
-        print(f"[RVC] Using cached models on {device}")
+        logger.debug(f"[RVC] Using cached models on {device}")
         return _rvc_cache[cache_key]
 
     models_dir = _ensure_models_dir()
@@ -54,19 +57,19 @@ def _get_or_create_models(
     if hubert_path is None:
         hubert_path = os.path.join(models_dir, "hubert_base.pt")
     if not os.path.exists(hubert_path):
-        print("[RVC] HuBERT not found, downloading...")
+        logger.info("[RVC] HuBERT not found, downloading...")
         hubert_path = download_model("hubert_base.pt", out_dir=models_dir)
 
-    print(f"[RVC] Loading HuBERT: {hubert_path}")
+    logger.info(f"[RVC] Loading HuBERT: {hubert_path}")
     hubert = Hubert(hubert_path, device=device)
 
-    print(f"[RVC] Loading RVC model: {rvc_model_path}")
+    logger.info(f"[RVC] Loading RVC model: {rvc_model_path}")
     rvc = RVCModel(rvc_model_path, device=device, index_path=index_path, fp16=fp16)
     if index_path and index_rate > 0.0:
         rvc.set_index(index_path, index_rate=index_rate)
 
     _rvc_cache[cache_key] = (hubert, rvc)
-    print(f"[RVC] Initialized on {device}")
+    logger.info(f"[RVC] Initialized on {device}")
     return hubert, rvc
 
 
@@ -117,7 +120,7 @@ def _extract_f0(
         if rmvpe_model_path is None:
             rmvpe_model_path = os.path.join(models_dir, "rmvpe.pt")
         if not os.path.exists(rmvpe_model_path):
-            print("[RVC] RMVPE not found, downloading...")
+            logger.info("[RVC] RMVPE not found, downloading...")
             rmvpe_model_path = download_model("rmvpe.pt", out_dir=models_dir)
         return extract_f0_rmvpe(wav, sr, rmvpe_model_path, device=device, thred=thred)
     return extract_f0(wav, sr, method=f0_method, device=device)
