@@ -97,19 +97,50 @@ def _export_mp3(audio: np.ndarray, sr: int, out_path: str, bitrate: int):
     seg.export(out_path, format="mp3", bitrate=f"{bitrate}k")
 
 
-def _auto_gain_db(audio: np.ndarray, target_peak_db: float = -1.0) -> float:
+def _measure_rms_db(audio: np.ndarray) -> float:
+    """Средняя громкость (RMS) в дБ. -120.0 для полной тишины."""
+    if len(audio) == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    if rms < 1e-9:
+        return -120.0
+    return 20 * np.log10(rms)
+
+
+def _auto_gain_db(
+    audio: np.ndarray,
+    target_peak_db: float = -1.0,
+    mode: str = "peak",
+    target_rms_db: float = -20.0,
+) -> float:
     """
-    Вычисляет дБ усиления/ослабления, чтобы довести пик сигнала до target_peak_db.
-    Полезно для батч-конверсии — приводит все реплики к одному уровню
-    громкости автоматически, без ручного подбора --gain для каждого файла.
-    target_peak_db=-1.0 — оставляет 1 дБ запаса от 0 dBFS (защита от
-    intersample-пиков при последующем MP3-энкодинге).
+    Вычисляет дБ усиления/ослабления для автонормализации.
+
+    mode="peak" (дефолт, обратная совместимость) — подтягивает пик сигнала
+    к target_peak_db. Проблема: если в файле есть один случайный всплеск
+    (плозив, щелчок, вдох) рядом с 0 dBFS, а остальной контент тихий —
+    "peak" почти не поднимет громкость, потому что потолок уже занят
+    этим единственным сэмплом.
+
+    mode="rms" — подтягивает СРЕДНЮЮ громкость к target_rms_db (обычно речь
+    мастерят в районе -20..-16 dBFS RMS). Решает случай выше: даже
+    если есть редкий пик, основной контент всё равно станет громче. Итоговый
+    гейн ограничен сверху так, чтобы пик не превысил target_peak_db —
+    RMS-таргет никогда не важнее защиты от клиппинга.
     """
     peak = float(np.abs(audio).max()) if len(audio) else 0.0
     if peak < 1e-6:
         return 0.0
-    target_linear = 10 ** (target_peak_db / 20.0)
-    return float(20 * np.log10(target_linear / peak))
+
+    peak_target_linear = 10 ** (target_peak_db / 20.0)
+    gain_for_peak_db = float(20 * np.log10(peak_target_linear / peak))
+
+    if mode == "peak":
+        return gain_for_peak_db
+
+    rms_db = _measure_rms_db(audio)
+    gain_for_rms_db = target_rms_db - rms_db
+    return min(gain_for_rms_db, gain_for_peak_db)
 
 
 def _apply_gain(audio: np.ndarray, gain_db: float) -> np.ndarray:
@@ -149,6 +180,8 @@ def convert_file(
     gain_db: float = 0.0,
     auto_gain: bool = False,
     target_peak_db: float = -1.0,
+    loudness_mode: str = "peak",
+    target_rms_db: float = -20.0,
 ) -> None:
     """Конвертирует один файл через RVC и сохраняет в нужном формате/параметрах."""
     from rvc_py.rvc_infer import rvc_infer
@@ -166,7 +199,9 @@ def convert_file(
 
     total_gain_db = gain_db
     if auto_gain:
-        total_gain_db += _auto_gain_db(out_wav, target_peak_db)
+        total_gain_db += _auto_gain_db(
+            out_wav, target_peak_db, mode=loudness_mode, target_rms_db=target_rms_db
+        )
 
     out_wav = _apply_gain(out_wav, total_gain_db)
 
@@ -202,6 +237,8 @@ def bulk_convert(
     gain_db: float = 0.0,
     auto_gain: bool = False,
     target_peak_db: float = -1.0,
+    loudness_mode: str = "peak",
+    target_rms_db: float = -20.0,
 ) -> list[str]:
     """
     Гоняет все файлы из input_path (файл или папка, рекурсивно) через RVC.
@@ -241,6 +278,7 @@ def bulk_convert(
                 bit_depth=bit_depth, mp3_bitrate=mp3_bitrate,
                 filter_radius=filter_radius, rms_mix_rate=rms_mix_rate, protect=protect,
                 gain_db=gain_db, auto_gain=auto_gain, target_peak_db=target_peak_db,
+                loudness_mode=loudness_mode, target_rms_db=target_rms_db,
             )
             outputs.append(out_path)
         except Exception as e:
@@ -301,6 +339,14 @@ def main():
     p.add_argument(
         "--target-peak", type=float, default=-1.0,
         help="Целевой пик в dBFS для --auto-gain (дефолт -1.0)",
+    )
+    p.add_argument(
+        "--loudness-mode", default="peak", choices=["peak", "rms"],
+        help="'peak' — по самому громкому сэмплу (дефолт). 'rms' — по средней громкости",
+    )
+    p.add_argument(
+        "--target-rms", type=float, default=-20.0,
+        help="Целевая средняя громкость в dBFS для --loudness-mode rms (дефолт -20.0)",
     )
 
     args = p.parse_args()
