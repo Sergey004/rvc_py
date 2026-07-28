@@ -77,6 +77,12 @@ class RVCStreamer:
         # Буфер накапливает данные @ 16kHz
         self._buf = np.zeros(0, dtype=np.float32)
 
+        # Реальный выходной SR самой RVC-модели (обычно 40000/48000, зависит
+        # от архитектуры) — узнаётся только после загрузки модели в _ensure_models().
+        # Дефолт 16000 ниже используется только в fallback-ветке _infer_block,
+        # если модель так и не загрузилась ни разу (без этого падёт с AttributeError).
+        self._native_sr = 16000
+
         # Модели — ленивая инициализация через кеш rvc_infer
         self._models_ready = False
 
@@ -96,7 +102,11 @@ class RVCStreamer:
             index_rate=self.index_rate,
         )
         self._models_ready = True
-        logger.info(f"RVCStreamer ready: {self.rvc_model_path} on {self.device}")
+        self._native_sr = self._rvc.sample_rate
+        logger.info(
+            f"RVCStreamer ready: {self.rvc_model_path} on {self.device} "
+            f"(native output SR: {self._native_sr})"
+        )
 
     # ── Ресэмплинг ───────────────────────────────────────────────────────────
 
@@ -119,7 +129,11 @@ class RVCStreamer:
     # ── RVC inference одного блока ────────────────────────────────────────────
 
     def _infer_block(self, frame_16k: np.ndarray) -> np.ndarray:
-        """Запускает RVC inference на одном блоке @ 16kHz. Возвращает аудио @ 16kHz."""
+        """Запускает RVC inference на одном блоке @ 16kHz.
+        ВНИМАНИЕ: возвращает аудио НЕ @ 16kHz, а @ self._native_sr —
+        реальном выходном SR самой RVC-модели (обычно 40000/48000).
+        Ответственность за финальный ресэмпл — на вызывающем push()/flush().
+        """
         import torch
         from rvc_py.rvc_infer import _extract_features, _extract_f0, _f0_to_coarse
 
@@ -184,8 +198,8 @@ class RVCStreamer:
         # Кроссфейд
         wav = self._apply_crossfade(wav)
 
-        # Ресэмпл в output_sr
-        return self._resample(wav, 16000, self.output_sr)
+        # Ресэмпл из реального SR модели (НЕ 16000!) в output_sr
+        return self._resample(wav, self._native_sr, self.output_sr)
 
     def flush(self) -> np.ndarray | None:
         """
@@ -201,7 +215,7 @@ class RVCStreamer:
 
         wav = self._infer_block(frame)
         wav = self._apply_crossfade(wav)
-        return self._resample(wav, 16000, self.output_sr)
+        return self._resample(wav, self._native_sr, self.output_sr)
 
     def reset(self):
         """Сбросить состояние между фразами."""

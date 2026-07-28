@@ -373,6 +373,7 @@ def main():
         protect=args.protect,
         gain_db=args.gain,
         auto_gain=args.auto_gain, target_peak_db=args.target_peak,
+        loudness_mode=args.loudness_mode, target_rms_db=args.target_rms,
         **cfg,
     )
 
