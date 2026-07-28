@@ -55,6 +55,7 @@ class RVCStreamer:
         crossfade: int = 512,       # зона плавного перехода
         input_sr: int = 24000,      # SR входного аудио (Chatterbox = 24kHz)
         output_sr: int = 16000,     # SR выходного аудио (XiaoZhi = 16kHz)
+        vad_threshold_db: float | None = -45.0,
     ):
         self.rvc_model_path = rvc_model_path
         self.device = device
