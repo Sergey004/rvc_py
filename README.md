@@ -14,7 +14,12 @@ Minimalist RVC (Retrieval-based Voice Conversion) inference package for Python, 
 ## Installation
 
 ```shell
-pip install -r requirements.txt
+pip install https://github.com/Sergey004/rvc_py.git
+```
+in edit (dev) mode
+
+```shell
+pip install -e .
 ```
 
 ## Usage
